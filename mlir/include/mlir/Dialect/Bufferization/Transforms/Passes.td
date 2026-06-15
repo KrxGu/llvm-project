@@ -184,6 +184,81 @@ def OptimizeAllocationLivenessPass
   let dependentDialects = ["mlir::memref::MemRefDialect"];
 }
 
+def StaticMemoryPlannerAnalysisPass
+    : Pass<"static-memory-planner-analysis"> {
+  let summary = "Transforms same-block alloc/dealloc pairs into static arena "
+                "allocation with computed offsets";
+  let description = [{
+    This pass identifies and transforms `memref.alloc` / `memref.dealloc` pairs
+    in the same basic block into a single static arena allocation. All eligible
+    allocations are packed into a shared i8 byte buffer with aligned offsets,
+    and accessed via `memref.view` operations.
+
+    For each allocation the pass checks a conservative eligibility envelope:
+    - Static memref shape.
+    - Unique same-block dealloc (found via `MemoryEffects::Free`).
+    - Not nested inside any loop or conditional region (e.g., `scf.for`,
+      `scf.while`, `scf.forall`, `scf.parallel`, `scf.if`).
+    - No cross-block alias or escaping use (alias set resolved via
+      `BufferViewFlowAnalysis`).
+
+    Eligible allocations are packed into a single arena using a trivial
+    sequential allocation strategy with alignment padding. The arena is an
+    i8 byte buffer (`memref<Nxi8>`) that can hold allocations of different
+    element types. Each original allocation is replaced with a `memref.view`
+    operation that creates a typed view into the arena at the computed offset.
+
+    Ineligible allocations are skipped and retain their original
+    alloc/dealloc operations. Skip reasons are reported via op remarks.
+    Aggregate counts are reported as pass statistics.
+
+    This pass is expected to run after the deallocation pipeline
+    (`ownership-based-buffer-deallocation` followed by
+    `bufferization-lower-deallocations`).
+
+    Example transformation:
+    ```mlir
+    // Before:
+    func.func @example() {
+      %0 = memref.alloc() : memref<1024xf32>
+      "some.use"(%0) : (memref<1024xf32>) -> ()
+      memref.dealloc %0 : memref<1024xf32>
+      return
+    }
+    
+    // After:
+    func.func @example() {
+      %arena = memref.alloc() {alignment = 1 : i64} : memref<4096xi8>
+      %c0 = arith.constant 0 : index
+      %0 = memref.view %arena[%c0][] : memref<4096xi8> to memref<1024xf32>
+      "some.use"(%0) : (memref<1024xf32>) -> ()
+      return
+    }
+    ```
+  }];
+
+  let options =
+      [Option<"arenaMode", "arena-mode", "std::string",
+              /*default=*/"\"allocate\"",
+              "Arena allocation mode: 'allocate' creates arena via AllocOp, "
+              "'arg' extracts arena from function arguments">];
+
+  let statistics =
+      [Statistic<"numEligible", "num-eligible",
+                 "Number of alloc/dealloc pairs eligible for static planning">,
+       Statistic<"numSkipDynamic", "num-skipped-dynamic",
+                 "Number of allocations skipped: dynamic shape">,
+       Statistic<
+           "numSkipNested", "num-skipped-nested",
+           "Number of allocations skipped: nested in loop or conditional">,
+       Statistic<"numSkipNoDealloc", "num-skipped-no-dealloc",
+                 "Number of allocations skipped: no unique same-block dealloc">,
+       Statistic<
+           "numSkipEscaping", "num-skipped-escaping",
+           "Number of allocations skipped: cross-block alias or escaping use">,
+  ];
+}
+
 def LowerDeallocationsPass : Pass<"bufferization-lower-deallocations"> {
   let summary = "Lowers `bufferization.dealloc` operations to `memref.dealloc`"
                 "operations";
